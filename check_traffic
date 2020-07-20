@@ -1,0 +1,730 @@
+#!/usr/bin/perl
+
+# check_tcptraffic is a nagios Nagios plugin to monitor the amount of TCP traffic
+#
+# check_tcptraffic uses the /proc/net/dev Linux entry to compute the
+# amount of transferred bytes from the last plugin execution (temporary
+# data is stored in the /tmp/check_tcptraffic-iface file)
+#
+# See  the INSTALL file for installation instructions
+#
+# Copyright (c) 2010-2011, ETH Zurich
+# Copyright (c) 2010-2016, Matteo Corti
+#
+# This module is free software; you can redistribute it and/or modify it
+# under the terms of GNU general public license (gpl) version 3.
+# See the LICENSE file for details.
+
+use 5.00800;
+
+use strict;
+use warnings;
+
+use Carp;
+use Data::Dumper;
+use English qw(-no_match_vars);
+use File::Basename;
+use Monitoring::Plugin::Threshold;
+use Monitoring::Plugin;
+use Monitoring::Plugin::Range;
+use Monitoring::Plugin::Getopt;
+use Readonly;
+
+################################################################################
+# constants
+
+our $VERSION = '2.2.6';
+
+Readonly my $MAX_LONG => 2**32;
+
+# IMPORTANT: Nagios plugins could be executed using embedded perl in this case
+#            the main routine would be executed as a subroutine and all the
+#            declared subroutines would therefore be inner subroutines
+#            This will cause all the global lexical variables not to stay shared
+#            in the subroutines!
+#
+# All variables are therefore declared as package variables...
+#
+
+## no critic (ProhibitPackageVars)
+
+use vars qw(
+  $help
+  $log_file
+  $options
+  $os_64_bit
+  $plugin
+  $result
+  $status
+  $status_msg
+  $threshold
+  $tmp
+);
+
+##############################################################################
+# subroutines
+
+use subs qw(verbose);
+
+##############################################################################
+# Usage     : debug( "message" )
+# Purpose   : writes a debugging message to the console and optionally to the
+#             debugging log file
+# Returns   : n/a
+# Arguments : the debugging message
+# Throws    : n/a
+# Comments  : n/a
+# See also  : n/a
+sub debug {
+
+    my $message = shift;
+
+    chomp $message;
+
+    if ( $options->debug() ) {
+        print "[DBG] $message\n";    ## no critic (RequireCheckedSyscalls)
+    }
+
+    if ( $options->debug_log() ) {
+
+        open $log_file, '>>',
+          $options->debug_log()
+          or $plugin->nagios_exit( UNKNOWN,
+            'Cannot open ' . $options->debug_log() . ": $OS_ERROR" );
+        print {$log_file} time
+          . " $message\n"
+          or $plugin->nagios_exit( UNKNOWN,
+            'Cannot write to ' . $options->debug_log() . ": $OS_ERROR" );
+        close $log_file
+          or $plugin->nagios_exit( UNKNOWN,
+            'Cannot close ' . $options->debug_log() . ": $OS_ERROR" );
+
+    }
+
+    return;
+
+}
+
+##############################################################################
+# Usage     : running_on_linux()
+# Purpose   : check if running on a Linux system
+# Returns   : true if running on Linux
+# Arguments : n/a
+# Throws    : n/a
+# Comments  : also checks if the OS is 64 bit capable and sets $os_64_bit
+# See also  : n/a
+sub running_on_linux {    ## no critic (RequireFinalReturn)
+
+    my $output;
+    my $pid;
+    my $linux;
+
+    # check the system
+    $pid = open $output, q{-|}, 'uname'
+      or
+      $plugin->nagios_exit( UNKNOWN, "Cannot determine the system: $OS_ERROR" );
+
+    while (<$output>) {
+        chomp;
+        verbose "running on $_\n";
+        $linux = $_ eq 'Linux';
+
+        close $output
+          or $plugin->nagios_exit( UNKNOWN, "Cannot close output: $OS_ERROR" );
+
+        # check the OS (32 or 64 bit)
+        $pid = open $output, q{-|}, 'uname -m';  ## no critic (RequireBriefOpen)
+        if ( !$pid ) {
+            carp "Cannot determine if the system is 64 bit capable: $OS_ERROR";
+            return $linux;
+        }
+
+        while (<$output>) {
+            chomp;
+            $os_64_bit = ( $_ eq 'x86_64' );
+            my $message;
+            if ($os_64_bit) {
+                $message = '64';
+            }
+            else {
+                $message = '32';
+            }
+            debug( $message . 'bit system' );
+            return $linux;
+        }
+
+        carp "Cannot determine if the system is 64 bit capable: $OS_ERROR";
+        return $linux;
+
+    }
+
+    $plugin->nagios_exit( UNKNOWN, 'Cannot determine the system' );
+
+}
+
+##############################################################################
+# Usage     : whoami()
+# Purpose   : retrieve the user runnging the process
+# Returns   : username
+# Arguments : n/a
+# Throws    : n/a
+# Comments  : n/a
+# See also  : n/a
+sub whoami {
+
+    my $output;
+
+    my $pid = open $output, q{-|}, 'whoami'    ## no critic (RequireBriefOpen)
+      or
+      $plugin->nagios_exit( UNKNOWN, "Cannot determine the user: $OS_ERROR" );
+
+    while (<$output>) {
+        chomp;
+        debug("user $_");
+        return $_;
+    }
+
+    $plugin->nagios_exit( UNKNOWN, 'Cannot determine the user' );
+
+    return;
+
+}
+
+##############################################################################
+# Usage     : assert_is_writable( 'filename' )
+# Purpose   : checks if the file can be written
+# Returns   : exits with UNKNOW status if not
+# Arguments : n/a
+# Throws    : n/a
+# Comments  : n/a
+# See also  : n/a
+sub assert_is_writable {
+
+    my $filename = shift;
+
+    if ( -e $filename ) {
+        if ( -f $filename ) {
+            if ( !-w $filename ) {
+                $plugin->nagios_exit( UNKNOWN,
+                    "File $filename exists and is not writable" );
+            }
+        }
+        else {
+            $plugin->nagios_exit( UNKNOWN,
+                "Cannot write to $filename: exists but is not a regular file" );
+        }
+    }
+    else {
+
+        # check the parent directory
+        my $directory = dirname($filename);
+
+        if ( !-e $directory ) {
+            $plugin->nagios_exit( UNKNOWN,
+"Cannot write to $filename: parent directory $directory does not exist"
+            );
+        }
+
+        if ( !-w $directory ) {
+            $plugin->nagios_exit( UNKNOWN,
+"Cannot write to $filename: parent directory $directory exists but is not writable"
+            );
+        }
+
+    }
+
+    return;
+
+}
+
+##############################################################################
+# Usage     : write_timer($data_in, $data_out)
+# Purpose   : writes the time and transmit data to the temporary file
+# Returns   : n/a
+# Arguments : n/a
+# Throws    : n/a
+# Comments  : n/a
+# See also  : n/a
+sub write_timer {
+
+    my $in_bytes  = shift;
+    my $out_bytes = shift;
+    my $in_packets  = shift;
+    my $out_packets = shift;
+    my $in_errors = shift;
+    my $out_errors  = shift;
+    my $in_drop = shift;
+    my $out_drop  = shift;
+
+    my $TMP;    # file handler
+
+    my $dbg_message = "writing to $tmp";
+
+    if ( !open $TMP, q{>}, $tmp ) {
+        debug("error: $OS_ERROR");
+        $plugin->nagios_exit( UNKNOWN, "Cannot initialize timer: $OS_ERROR" );
+    }
+
+    my $line = time . " $in_bytes $out_bytes $in_packets $out_packets $in_errors $out_errors $in_drop $out_drop \n";
+    print {$TMP} $line;    ## no critic (RequireCheckedSyscalls)
+    debug("$dbg_message: $line");
+
+    close $TMP
+      or $plugin->nagios_exit( UNKNOWN, "Cannot close timer: $OS_ERROR" );
+
+    return;
+
+}
+
+##############################################################################
+# Usage     : $time = uptime()
+# Purpose   : returns the number of seconds since tha last boot
+# Returns   : returns the number of seconds since tha last boot
+# Arguments : n/a
+# Throws    : n/a
+# Comments  : n/a
+# See also  : n/a
+sub uptime {
+
+    my $dev_file = '/proc/uptime';
+    my $IN;     # file descriptor
+    my $result;
+
+    open $IN, q{<}, $dev_file    ## no critic (RequireBriefOpen)
+      or $plugin->nagios_exit( UNKNOWN, "Cannot open $dev_file: $OS_ERROR" );
+
+    while (<$IN>) {
+
+        chomp;
+
+	s/\ .*//mxs;
+
+	$result =  $_;
+
+    }
+
+    close $IN
+	or $plugin->nagios_exit( UNKNOWN, "Cannot close $dev_file: $OS_ERROR" );
+
+    debug("uptime $result");
+
+    return $result;
+
+}
+
+##############################################################################
+# Usage     : read_proc('eth0')
+# Purpose   : reads information about an interface in the proc file system
+# Returns   : an hash containing the interface info
+# Arguments : iface : interface name
+# Throws    : n/a
+# Comments  : n/a
+# See also  : n/a
+sub read_proc {
+
+    my $iface = shift;
+
+    my %data;
+
+    my $found = 0;
+    my $time;
+    my ($prev_bytes_in, $prev_bytes_out, $prev_packets_in, $prev_packets_out, $prev_errors_in, $prev_errors_out, $prev_drop_in, $prev_drop_out) = (0) x 8;;
+    my $IN;     # file descriptor
+    my $TMP;    # file descriptor
+
+    my $dev_file = '/proc/net/dev';
+
+    open $IN, q{<}, $dev_file    ## no critic (RequireBriefOpen)
+      or $plugin->nagios_exit( UNKNOWN, "Cannot open $dev_file: $OS_ERROR" );
+
+    while (<$IN>) {
+
+        chomp;
+
+        if (/:/mxs) {
+
+         # /proc/net/dev format
+         #
+         # bytes:      The total number of bytes of data transmitted or received
+         #             by the interface.
+         # packets:    The total number of packets of data transmitted or
+         #             received by the interface.
+         # errs:       The total number of transmit or receive errors detected
+         #             by the device driver.
+         # drop:       The total number of packets dropped by the device driver.
+         # fifo        The number of FIFO buffer errors.
+         # frame:      The number of packet framing errors.
+         # compressed: The number of compressed packets transmitted or received
+         #             by the device driver.
+         # multicast:  The number of multicast frames transmitted or received by
+         #             the device driver.
+
+     # hack: some kernels now put some whitespace between the colon and bytes in
+            s/:\s+/:/mxs;
+
+            my (
+                $combined,      $packets_in,   $errors_in,
+                $drop_in,       $fifo_in,      $frame_in,
+                $compressed_in, $multicast_in, $bytes_out,
+                $packets_out,   $errors_out,     $drop_out,
+                $fifo_out,      $frame_out,    $compressed_out,
+                $multicast_out
+            ) = split;
+
+            my ( $name, $bytes_in ) = split /:/mxs, $combined;
+
+            if ( $name eq $options->interface() ) {
+
+                $found = 1;
+
+                $data{combined}       = $combined;
+                $data{packets_in}     = $packets_in;
+                $data{errors_in}        = $errors_in;
+                $data{drop_in}        = $drop_in;
+                $data{fifo_in}        = $fifo_in;
+                $data{frame_in}       = $frame_in;
+                $data{compressed_in}  = $compressed_in;
+                $data{multicast_in}   = $multicast_in;
+                $data{bytes_out}      = $bytes_out;
+                $data{packets_out}    = $packets_out;
+                $data{errors_out}       = $errors_out;
+                $data{drop_out}       = $drop_out;
+                $data{fifo_out}       = $fifo_out;
+                $data{frame_out}      = $frame_out;
+                $data{compressed_out} = $compressed_out;
+                $data{multicast_out}  = $multicast_out;
+                $data{bytes_in}       = $bytes_in;
+
+                # get the time difference
+                if ( $options->reset() || !open $TMP, q{<}, $tmp )
+                {    ## no critic (RequireBriefOpen)
+                    write_timer( $bytes_in, $bytes_out, $packets_in, $packets_out, $errors_in, $errors_out, $drop_in, $drop_out );
+                    $plugin->nagios_exit( UNKNOWN, 'Initializing timer' );
+                }
+
+                while (<$TMP>) {
+                    chomp;
+                    ( $time, $prev_bytes_in, $prev_bytes_out, $prev_packets_in, $prev_packets_out, $prev_errors_in, $prev_errors_out, $prev_drop_in, $prev_drop_out ) = split;
+                    $data{time_diff}     = time - $time;
+                    $data{prev_bytes_in}       = $prev_bytes_in;
+                    $data{prev_bytes_out}      = $prev_bytes_out;
+                    $data{prev_packets_in}     = $prev_packets_in;
+                    $data{prev_packets_out}    = $prev_packets_out;
+                    $data{prev_errors_in}     = $prev_errors_in;
+                    $data{prev_errors_out}    = $prev_errors_out;
+                    $data{prev_drop_in}     = $prev_drop_in;
+                    $data{prev_drop_out}    = $prev_drop_out;
+                    debug("reading old data: $time $prev_bytes_in $prev_bytes_out, $prev_packets_in, $prev_packets_out, $prev_errors_in, $prev_errors_out, $prev_drop_in, $prev_drop_out after $data{time_diff}");
+                }
+
+                close $TMP
+                  or $plugin->nagios_exit( UNKNOWN,
+                    "Cannot close $tmp: $OS_ERROR" );
+
+                write_timer( $bytes_in, $bytes_out, $packets_in, $packets_out, $errors_in, $errors_out, $drop_in, $drop_out );
+
+                last;
+
+            }
+
+        }
+
+    }
+
+    if ( !$found ) {
+        $plugin->nagios_exit( UNKNOWN,
+            'Interface ' . $options->interface() . ' not found' );
+    }
+
+    close $IN
+      or $plugin->nagios_exit( UNKNOWN, "Cannot close $dev_file: $OS_ERROR" );
+
+    return %data;
+
+}
+
+##############################################################################
+# Usage     : verbose("some message string", $optional_verbosity_level);
+# Purpose   : write a message if the verbosity level is high enough
+# Returns   : n/a
+# Arguments : message : message string
+#             level   : options verbosity level
+# Throws    : n/a
+# Comments  : n/a
+# See also  : n/a
+sub verbose {
+
+    # arguments
+    my $message = shift;
+    my $level   = shift;
+
+    if ( !defined $message ) {
+        $plugin->nagios_exit( UNKNOWN,
+            q{Internal error: not enough parameters for 'verbose'} );
+    }
+
+    if ( !defined $level ) {
+        $level = 0;
+    }
+
+    debug($message);
+
+    if (   $level < $options->verbose()
+        || $options->debug() )
+    {
+        print $message;    ## no critic (RequireCheckedSyscalls)
+    }
+
+    return;
+
+}
+
+##############################################################################
+# main
+#
+
+################
+# Initialization
+
+$os_64_bit  = 0;
+$plugin     = Monitoring::Plugin->new( shortname => 'TCPTRAFFIC' );
+$status     = 0;
+$status_msg = q{};
+
+########################
+# Command line arguments
+
+$options = Monitoring::Plugin::Getopt->new(
+    usage   => 'Usage: %s [OPTIONS]',
+    version => $VERSION,
+    url     => 'https://github.com/matteocorti/check_tcptraffic',
+    blurb   => 'Monitors the amount of traffic on a given interface',
+);
+
+$options->arg(
+    spec => 'critical|c=s',
+    help =>
+      'Exit with CRITICAL status if traffic is outside of the specified range',
+    required => 1,
+);
+
+$options->arg(
+    spec => 'warning|w=s',
+    help =>
+      'Exit with WARNING status if traffic is outside of the specified range',
+    required => 1,
+);
+
+$options->arg(
+    spec     => 'interface|i=s',
+    help     => 'network interface to monitor',
+    required => 1,
+);
+
+$options->arg(
+    spec     => 'speed|s=i',
+    help     => 'speed (in Mbit/s)',
+    required => 1,
+);
+
+$options->arg(
+    spec => 'reset|r',
+    help => 'initialize counter',
+);
+
+$options->arg(
+    spec     => 'debug|d',
+    help     => 'debugging output',
+    required => 0,
+);
+
+$options->arg(
+    spec     => 'debug_log=s',
+    help     => 'generates a log with debugging information',
+    required => 0,
+);
+
+$options->getopts();
+
+###############
+# Sanity checks
+
+if ( $options->debug_log() ) {
+    assert_is_writable( $options->debug_log() );
+}
+debug('------------------------------------------');
+
+if ( !running_on_linux() ) {
+    $plugin->nagios_exit( UNKNOWN, 'Not running on a Linux system' );
+}
+
+# parse the critical and warning ranges
+my $critical_range =
+  Monitoring::Plugin::Range->parse_range_string( $options->critical() );
+if ( !( $critical_range && $critical_range->is_set() ) ) {
+    $plugin->nagios_exit( UNKNOWN, 'Could not parse "critical"' );
+}
+
+my $warning_range =
+  Monitoring::Plugin::Range->parse_range_string( $options->warning() );
+if ( !( $warning_range && $warning_range->is_set() ) ) {
+    $plugin->nagios_exit( UNKNOWN, 'Could not parse "warning"' );
+}
+
+# check the speed (depending on the counter size in bits)
+
+my $max_check_time;    # in seconds
+
+# size    max (bytes)  max (bits)       max (Mbits)
+# -----------------------------------------------------------
+# 64 bit  2^32         2^64*8 -> 2^67   2^67 / 1024^2 -> 2^47
+# 32 bit  2^32         2^32*8 -> 2^35   2^38 / 1024^2 -> 2^15
+
+#<<<
+if ($os_64_bit) {
+    $max_check_time = int( ( 2**47 - 1 ) / $options->speed() ); ## no critic (ProhibitMagicNumbers)
+}
+else {
+    $max_check_time = int( ( 2**15 - 1 ) / $options->speed() ); ## no critic (ProhibitMagicNumbers)
+}
+#>>>
+verbose
+  "the counters can hold data for $max_check_time seconds before overflow\n";
+
+$threshold = Monitoring::Plugin::Threshold->set_thresholds(
+    warning  => $warning_range,
+    critical => $critical_range,
+);
+
+$tmp = '/tmp/check_tcptraffic_status-' . $options->interface() . whoami();
+
+########################
+# Check the proc entry
+
+my %data = read_proc( $options->interface() );
+
+# check if the files are older than the last boot
+
+my $uptime = uptime();
+
+if ( $data{time_diff} > $uptime ) {
+
+    warn Dumper \%data;
+
+    verbose 'the time since last check ('
+      . $data{time_diff}
+      . 's) is greater than the uptime '
+      . $uptime
+      . "s): sleeping 1s to gather data again\n";
+
+    # the system was rebooted
+
+    write_timer( $data{bytes_in}, $data{bytes_out}, $data{packets_in}, $data{packets_out}, $data{errors_in}, $data{errors_out}, $data{drop_in}, $data{drop_out} );
+
+    sleep 1;
+
+    %data = read_proc( $options->interface() );
+
+} elsif ( $data{time_diff} > $max_check_time ) {
+
+    verbose 'the time from last check ('
+      . $data{time_diff}
+      . 's) is greater than the maximum check time allowed with speed '
+      . $options->speed() . ' ('
+      . $max_check_time
+      . "s): sleeping 1s to gather data again\n";
+
+    # time difference is > max_check_time
+    # since the counter could overflow
+    # we reeinitilize the timer and
+    # we perform a 1s check
+
+    write_timer( $data{bytes_in}, $data{bytes_out}, $data{packets_in}, $data{packets_out}, $data{errors_in}, $data{errors_out}, $data{drop_in}, $data{drop_out} );
+
+    sleep 1;
+
+    %data = read_proc( $options->interface() );
+
+}
+
+if ( $data{time_diff} == 0 ) {
+
+    # round up
+    $data{time_diff} = 1;
+
+}
+
+sub calculate_diff {
+  my ( $acutal_data, $prev_data, $time_diff ) = @_;
+  my $return_data;
+  if ( $acutal_data >= $prev_data ) {
+      $return_data = int( ( $acutal_data - $prev_data ) / $time_diff );
+      debug(
+          "DATA: $return_data = int( ( $acutal_data - $prev_data ) / $time_diff )"
+      );
+  }
+  else {
+
+      # the old value is larger than the new one: the counter overflowed
+      $return_data = ( ( $MAX_LONG - $prev_data + $acutal_data ) / $time_diff );
+      debug(
+  "IN (overflow):  $return_data = int( ( $MAX_LONG - $prev_data + $acutal_data ) / $time_diff )"
+      );
+  }
+  return $return_data;
+}
+
+my $traffic_in = calculate_diff($data{bytes_in}, $data{prev_bytes_in},  $data{time_diff});
+my $traffic_out = calculate_diff($data{bytes_out}, $data{prev_bytes_out},  $data{time_diff});
+my $packets_in = calculate_diff($data{packets_in}, $data{prev_packets_in},  $data{time_diff});
+my $packets_out = calculate_diff($data{packets_out}, $data{prev_packets_out},  $data{time_diff});
+my $errors_in = calculate_diff($data{errors_in}, $data{prev_errors_in},  $data{time_diff});
+my $errors_out = calculate_diff($data{errors_out}, $data{prev_errors_out},  $data{time_diff});
+my $drop_in = calculate_diff($data{drop_in}, $data{prev_drop_in},  $data{time_diff});
+my $drop_out = calculate_diff($data{drop_out}, $data{prev_drop_out},  $data{time_diff});
+
+my $traffic = $traffic_in + $traffic_out;
+my $packets = $packets_in + $packets_out;
+my $errors = $errors_in + $errors_out;
+my $drop = $drop_in + $drop_out;
+
+debug("BYTES: $traffic = $traffic_in + $traffic_out");
+debug("PACKETS: $packets = $packets_in + $packets_out");
+debug("ERRORS: $errors = $errors_in + $errors_out");
+debug("DROPED: $drop = $drop_in + $drop_out");
+
+
+sub print_perfvalue {
+  my ( $label, $value, $uom ) = @_;
+  $plugin->add_perfdata(
+    label => $label,
+    value => sprintf( '%.0f', $value ),
+    uom => $uom,
+  );
+}
+
+$plugin->add_perfdata(
+    label     => 'BYTES_TOTAL',
+    value     => sprintf( '%.0f', $traffic ),
+    uom       => 'B',
+    threshold => $threshold,
+);
+
+print_perfvalue('BYTES_OUT', $traffic_out, 'B');
+print_perfvalue('BYTES_IN', $traffic_in, 'B');
+print_perfvalue('PACKETS_TOTAL', $packets, '');
+print_perfvalue('PACKETS_IN', $packets_in, '');
+print_perfvalue('PACKETS_OUT', $packets_out, '');
+print_perfvalue('ERRORS_TOTAL', $errors, '');
+print_perfvalue('ERRORS_IN', $errors_in, '');
+print_perfvalue('ERRORS_OUT', $errors_out, '');
+print_perfvalue('DROPED_TOTAL', $drop, '');
+print_perfvalue('DROPED_IN', $drop_in, '');
+print_perfvalue('DROPED_OUT', $drop_out, '');
+print_perfvalue('TIME', $data{time_diff}, '');
+
+
+$plugin->nagios_exit( $threshold->get_status($traffic),
+    $options->interface() . q{ } . sprintf( '%.0f', $traffic ) . ' bytes/s' );
+
+1;
