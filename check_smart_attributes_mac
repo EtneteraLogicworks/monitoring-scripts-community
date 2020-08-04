@@ -3,7 +3,7 @@
 use strict;
 use warnings;
 use Getopt::Long qw(:config no_ignore_case);
-use Config::JSON;
+use JSON;
 use Storable qw(dclone);
 
 our $VERSION = "1.6";
@@ -37,6 +37,28 @@ our %hdrmap_nvme = (
 	'Error Information Log Entries' => 14,
 	'Warning  Comp. Temperature Time' => 15,
 	'Critical Comp. Temperature Time' => 16
+);
+
+our %hdrmap_sas = (
+    'Elements in grown defect list' => 0,
+    'read' => [
+        'Read errors corrected by ECC (fast)',
+        'Read errors corrected by ECC (delayed)',
+        'Read errors corrected by ECC (reread)',
+        'Total read errors corrected',
+        'Total read correction algorithm invocations',
+        'Total read gigabytes processed',
+        'Total uncorrected read errors'
+    ],
+    'write' => [
+        'Write errors corrected by ECC (fast)',
+        'Write errors corrected by ECC (delayed)',
+        'Write errors corrected by ECC (rewrite)',
+        'Total write errors corrected',
+        'Total write correction algorithm invocations',
+        'Total write gigabytes processed',
+        'Total uncorrected write errors'
+    ]
 );
 
 sub getVersionString{
@@ -173,12 +195,14 @@ sub getHelpString{
 
 sub readUCfgJSON{
 	my $uCfgJSON = shift;
-	return(Config::JSON->new($uCfgJSON));
+	my $file_content = do { open my $fh, '<', $uCfgJSON; local $/; <$fh> };
+	return(decode_json($file_content));
 }
 
 sub readDbJSON{
 	my $dbJSON = shift;
-	return(Config::JSON->new($dbJSON));
+	my $file_content = do { open my $fh, '<', $dbJSON; local $/; <$fh> };
+	return(decode_json($file_content));
 }
 
 sub parseMegaraidRegex{
@@ -191,6 +215,25 @@ sub parseMegaraidRegex{
 		}
 	}
 	return @megadevs;
+}
+
+sub genAttributeName{
+	my $device = shift;
+	my $attributeName= shift;
+
+	# Parse device for prepending attribute name with device
+	my $currDevice;
+	if($device =~ m/(nvme[a-z0-9])+$/){
+		$currDevice = $1;
+	}
+	elsif($device =~ m/^\/dev\/(?:disk\/by-id\/)?([A-Za-z0-9_\-,\.]+)$/){
+		$currDevice = $1;
+	}
+	$attributeName = $currDevice.'_'.$attributeName;
+	# Replace characters not valid in sensor names
+	$attributeName =~ s/\s/_/g;
+	$attributeName =~ s/[\(\)]//g;
+	return $attributeName;
 }
 
 sub findDevicesByRegex{
@@ -207,7 +250,7 @@ sub findDevicesByRegex{
 			exit(STATE_UNKNOWN);
 		}
 		# Since older versions of find don't support multiple types, loop over each type separately
-		my @findtypes_a = ('f','b','l');
+		my @findtypes_a = ('f','b','l','c');
 		foreach my $type (@findtypes_a){
 			my @founddevices_tmp;
 			@founddevices_tmp = `$findcmd /dev -regextype egrep -regex $devicepattern -type $type`;
@@ -253,8 +296,9 @@ sub getSmartctl{
 		elsif($device =~ /^(megaraid[0-9]+),(\/dev\/[a-zA-Z]+)$/){
 			my $megaDevice = $1;
 			my $devicePath = $2;
-			my $megaDeviceOptions = $megaDevice;
+			# Insert a ',' after 'megaraid'
 			substr($megaDevice,8,0,',');
+			my $megaDeviceOptions = $megaDevice;
 			# Device path and megaraid device are used together to
 			# check the attributes with smartctl
 			if(defined($extraOpts)){
@@ -309,13 +353,14 @@ sub getSmartctl{
 			$device = '/dev/'.$twDevice;
 		}
 		# Check if Areca format is used
-		elsif($device =~ /^(areca),([0-9])+\/([0-9]+),(\/dev\/sg[0-9]+)$/){
-			my $arecaDevice = $1 . "," . $2 . "," . $3;
+		elsif($device =~ /^(areca),([0-9]+)\/([0-9]+),(\/dev\/sg[0-9]+)$/){
+			my $arecaDevice = $1 . "," . $2 . "/" . $3;
 			my $devicePath = $4;
 			# Call smartctl
 			@output = `$smartctl -a -d $arecaDevice $devicePath`;
 			# From now on we use only e.g. areca_1_1 as device
 			$arecaDevice =~ s/,/_/g;
+			$arecaDevice =~ s/\//_/g;
 			$device = '/dev/'.$arecaDevice;
 		}
 		else{
@@ -346,12 +391,12 @@ sub checkWhichDevice{
 	my @devices_missing_a;
 
 	# Fetch the device JSON hash
-	my $devices_h = $dbConfig->get("Devices");
+	my $devices_h = $dbConfig->{'Devices'};
 
 	# If given, fetch the user config for the devices
 	my $uCfgDevices_h;
 	if(defined($uCfgJSON)){
-		$uCfgDevices_h = $uCfgJSON->get("Devices");
+		$uCfgDevices_h = $uCfgJSON->{'Devices'};
 	}
 
 	# Check each device whose smartvalues are present
@@ -361,9 +406,14 @@ sub checkWhichDevice{
 			if($ssdonly & !grep { /Solid State Device/i } @smartctlOut){ next }
 		}
 		my @model = grep { /Model Family/i || /Device Model/i || /^Product:/i } @smartctlOut;
+		my @transport = grep { /^Transport protocol:/i } @smartctlOut;
 		# NVMe devices don't require a database entry, use the generic NVMe one
 		if ($device =~ /nvme[a-z0-9]+$/) {
 			@model = ('Generic NVMe');
+		}
+		# SAS devices don't require a database entry, use the generic SAS one
+		elsif (@transport && $transport[0] =~ /SAS/) {
+			@model = ('Generic SAS');
 		}
 		my $found = 0;# We have not found the device yet
 		foreach my $currModel (@model){
@@ -378,6 +428,9 @@ sub checkWhichDevice{
 					# For NVMe we don't have a specific model, but we use the smartdb's generic NVMe entry
 					if(($currModel =~ /NVMe/) && ($currModel =~ /$_/)){
 						$found=1;
+					}
+					if(($currModel =~ /Generic SAS/) && ($currModel =~ /$_/)){
+						$found =1;
 					}
 					if($found == 1){
 						my %foundDevice_h;
@@ -430,6 +483,7 @@ sub parseSmartctlOut{
 		# Check for smart value lines
 		my @smartValues;
 		my @splittedLine;
+		my @transport = grep { /^Transport protocol:/i } @smartctlOut;
 		foreach my $line (@smartctlOut) {
 			if($line =~ /\d+\s+[A-Za-z0-9_\/]+\s+0[xX][0-9a-fA-F]+\s+\d+\s+\d+\s+[0-9\-]+\s+\w+/){
 				$line =~ s/^\s+|\s+$//g;
@@ -440,8 +494,7 @@ sub parseSmartctlOut{
 				for(my $i = 0; $i < @hdrmap_a; $i++){
 					# Prepend the attribute name with the device name
 					if($hdrmap_a[$i] eq 'ATTRIBUTE_NAME'){
-						$device =~ m/^\/dev\/(?:disk\/by-id\/)?([A-Za-z0-9_\-,\.]+)$/;
-						$lineValues_h{$hdrmap_a[$i]} = $1.'_'.$splittedLine[$i];
+						$lineValues_h{$hdrmap_a[$i]} = genAttributeName($device, $splittedLine[$i]);
 					}
 					else{
 						$lineValues_h{$hdrmap_a[$i]} = $splittedLine[$i];
@@ -465,21 +518,60 @@ sub parseSmartctlOut{
 					# Data units are presented as 1000 512bytes, convert it
 					if($lineValues_h{'ATTRIBUTE_NAME'} eq "Data Units Read" ||
 					$lineValues_h{'ATTRIBUTE_NAME'} eq "Data Units Written"){
-						$lineValues_h{'RAW_VALUE'} =~ m/^(\d+)\[/;
+						$lineValues_h{'RAW_VALUE'} =~ m/^(\d+)\[?/;
 						$lineValues_h{'RAW_VALUE'} = ($1*512000)/(1000**3);
 					}
+					$lineValues_h{'ATTRIBUTE_NAME'} = genAttributeName($device, $lineValues_h{'ATTRIBUTE_NAME'});
 					push @smartValues, \%lineValues_h;
+				}
+			}
+			elsif(@transport && $transport[0] =~ /SAS/ && $line =~ /([A-Za-z\s]+)\:\s+(.+)$/) {
+				if(exists $hdrmap_sas{$1}){
+					my $idoffset = 1;
+					if (ref $hdrmap_sas{$1} eq 'ARRAY') {
+						my $op = $1;
+						my $values = $2;
+						my $n = 0;
+						while ($values =~ /([\d,\.]+)/g) {
+							my %lineValues_h;
+							$lineValues_h{'ATTRIBUTE_NAME'} = $hdrmap_sas{$op}->[$n];
+							$lineValues_h{'ID#'} = $n + $idoffset;
+							$lineValues_h{'RAW_VALUE'} = $1;
+							$lineValues_h{'ATTRIBUTE_NAME'} = genAttributeName($device, $lineValues_h{'ATTRIBUTE_NAME'});
+							push @smartValues, \%lineValues_h;
+							$n++;
+						}
+						$idoffset += 7;
+					}
+					else {
+						my %lineValues_h;
+						$lineValues_h{'ATTRIBUTE_NAME'} = $1;
+						$lineValues_h{'ID#'} = $hdrmap_sas{$1};
+						$lineValues_h{'RAW_VALUE'} = $2;
+						$lineValues_h{'ATTRIBUTE_NAME'} = genAttributeName($device, $lineValues_h{'ATTRIBUTE_NAME'});
+						push @smartValues, \%lineValues_h;
+					}
 				}
 			}
 			if($line =~ /(ATA Error Count)\:\s+(\d+)/){
 				my %lineValues_h;
 				$lineValues_h{'ATTRIBUTE_NAME'} = $1;
 				$lineValues_h{'VALUE'} = $2;
-				# Modify attribute name
-				$device =~ /^\/dev\/([A-Za-z0-9_,]+)$/;
-				$lineValues_h{'ATTRIBUTE_NAME'} =$1.'_'.$lineValues_h{'ATTRIBUTE_NAME'};
-				$lineValues_h{'ATTRIBUTE_NAME'} =~ s/ /_/g;
 				$lineValues_h{'ID#'} = 1024;
+				$lineValues_h{'ATTRIBUTE_NAME'} = genAttributeName($device, $lineValues_h{'ATTRIBUTE_NAME'});
+				push @smartValues, \%lineValues_h;
+			}
+			if($line =~ /(SMART overall-health self-assessment test result)\:\s(\w+)/){
+				my %lineValues_h;
+				$lineValues_h{'ATTRIBUTE_NAME'} = 'Overall_Health_Test_Result';
+				$lineValues_h{'ID#'} = 1025;
+				if($2 eq 'PASSED'){
+					$lineValues_h{'VALUE'} = 0;
+				}
+				else{
+					$lineValues_h{'VALUE'} = 1;
+				}
+				$lineValues_h{'ATTRIBUTE_NAME'} = genAttributeName($device, $lineValues_h{'ATTRIBUTE_NAME'});
 				push @smartValues, \%lineValues_h;
 			}
 		}
@@ -526,25 +618,25 @@ sub checkSmartctl{
 		# Check the corresponding smart values
 		foreach my $row (@smartValues_a){
 			my $ID = $row->{'ID#'};
-			if(exists $IDs_h{$ID} && exists $threshs_h{$ID}){
+			if(exists $IDs_h{$ID}{'value'} && exists $threshs_h{$ID}){
 				if(defined($threshs_h{$ID}->[2])){
 					# Check if a bit pattern exits, then shift it
 					$threshs_h{$ID}->[2] =~ /^([l,r])([0-9]+)$/;
 					my $shift_dir = $1;
 					my $shift_ct = $2;
 					if($shift_dir eq 'l'){
-						$row->{$IDs_h{$ID}} = $row->{$IDs_h{$ID}} << $2;
+						$row->{$IDs_h{$ID}{'value'}} = $row->{$IDs_h{$ID}{'value'}} << $2;
 					}
 					if($shift_dir eq 'r'){
-						$row->{$IDs_h{$ID}} = $row->{$IDs_h{$ID}} >> $2;
+						$row->{$IDs_h{$ID}{'value'}} = $row->{$IDs_h{$ID}{'value'}} >> $2;
 					}
 				}
-				if(!(checkThreshs($row->{$IDs_h{$ID}},$threshs_h{$ID}->[0]))){
+				if(!(checkThreshs($row->{$IDs_h{$ID}{'value'}},$threshs_h{$ID}->[0]))){
 					# Don't loose the critical state
 					$statusLevel_a[0] = 'Warning' unless $statusLevel_a[0] eq 'Critical';
 					push @warnings_a, $row->{'ATTRIBUTE_NAME'};
 				}
-				if(!(checkThreshs($row->{$IDs_h{$ID}},$threshs_h{$ID}->[1]))){
+				if(!(checkThreshs($row->{$IDs_h{$ID}{'value'}},$threshs_h{$ID}->[1]))){
 					$statusLevel_a[0] = 'Critical';
 					pop @warnings_a;
 					push @criticals_a, $row->{'ATTRIBUTE_NAME'};
@@ -608,8 +700,8 @@ sub getStatusString{
 					foreach my $row (@smartValues_a){
 						if($row->{'ATTRIBUTE_NAME'} eq $sensor){
 							my $ID = $row->{'ID#'};
-							if(exists $IDs_h{$ID}){
-								$status_str .= " (".$row->{$IDs_h{$ID}}.")";
+							if(exists $IDs_h{$ID}{'value'}){
+								$status_str .= " (".$row->{$IDs_h{$ID}{'value'}}.")";
 							}
 						}
 					}
@@ -645,15 +737,15 @@ sub getPerfString{
 				if($perf eq $row->{'ID#'}){
 					my $ID = $row->{'ID#'};
 					my $attr_str;
-					if(exists $IDs_h{$ID}){
-						$attr_str = "'".$row->{'ATTRIBUTE_NAME'}."'=".$row->{$IDs_h{$ID}};
+					if(exists $IDs_h{$ID}{'value'}){
+						$attr_str = "'".$row->{'ATTRIBUTE_NAME'}."'=".$row->{$IDs_h{$ID}{'value'}};
 						if($perf_str){
 							$attr_str = " ".$attr_str;
 						}
 					}
 					$perf_str .= $attr_str;
 					# If available also print its thresholds
-					if(exists $IDs_h{$ID} && exists $threshs_h{$ID}){
+					if(exists $IDs_h{$ID}{'value'} && exists $threshs_h{$ID}){
 						$threshs_h{$ID}->[0] =~ /(\d+)/;
 						$perf_str .= ';'.$1.';';
 						$threshs_h{$ID}->[1] =~ /(\d+)/;
@@ -681,9 +773,9 @@ sub getVerboseString{
 
 		foreach my $row (@smartValues_a){
 			my $ID = $row->{'ID#'};
-			if(exists $IDs_h{$ID}){
-				$verb_str .= "\n".$row->{'ATTRIBUTE_NAME'}." = ".$row->{$IDs_h{$ID}};
-				$verb_str .= " (".$IDs_h{$ID}.")";
+			if(exists $IDs_h{$ID}{'value'}){
+				$verb_str .= "\n".$row->{'ATTRIBUTE_NAME'}." = ".$row->{$IDs_h{$ID}{'value'}};
+				$verb_str .= " (".$IDs_h{$ID}{'value'}.")";
 			}
 		}
 		$verb_str .= "\n";
