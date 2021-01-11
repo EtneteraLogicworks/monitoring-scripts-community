@@ -57,7 +57,7 @@ usage()
         -l      Location of speedtest server - *Required * - takes either "i" or "e". If you pass "i" for
                 Internal then you will need to pass the URL of the Mini Server to the "s" option. If you pass
                 "e" for External then you must pass the server integer to the "s" option.
-	-s	Server integer or URL for the speedtest server to test against - *Required* - Run
+	-s	Server integer or URL for the speedtest server to test against - Run
 		"speedtest --list | less" to find your nearest server and note the number of the server
                 or use the URL of an internal Speedtest Mini Server
 	-p	Output Performance Data
@@ -239,7 +239,7 @@ then
 fi
 
 # Check for empty arguments and exit to usage if found
-if  [[ -z $DLw ]] || [[ -z $DLc ]] || [[ -z $ULw ]] || [[ -z $ULc ]] || [[ -z $Loc ]] || [[ -z $SEs ]]
+if  [[ -z $DLw ]] || [[ -z $DLc ]] || [[ -z $ULw ]] || [[ -z $ULc ]] || [[ -z $Loc ]]
 then
 	usage
 	exit 3
@@ -292,8 +292,8 @@ if [ "$debug" == "TRUE" ]; then
 	echo "Download Critical Level = "$DLc
 	echo "Upload Warning Level = "$ULw
 	echo "Upload Critical Level = "$ULc
-        echo "Server Location = "$Loc
-        echo "Server URL or Integer = "$SEs
+	echo "Server Location = "$Loc
+	echo "Server URL or Integer = "$SEs
 fi
 
 #Set command up depending upon internal or external
@@ -301,7 +301,14 @@ if [ "$Loc" == "e" ]; then
 	if [ "$debug" == "TRUE" ]; then
 		echo "External Server defined"
 	fi
-	command=$($STb/speedtest --server=$SEs --simple)
+	command_str="${STb}/speedtest --simple"
+	if [ -n "$SEs" ]; then
+		command_str="${command_str} --server=${SEs}"
+		[ "$debug" == "TRUE" ] && "Using Server ID: ${SEs}"
+	else
+		[ "$debug" == "TRUE" ] && "No Server ID defined. Using first available server"
+	fi
+	command=$($command_str)
 elif [ "$Loc" == "i" ]; then
 	if [ "$debug" == "TRUE" ]; then
 		echo "Internal Server defined"
