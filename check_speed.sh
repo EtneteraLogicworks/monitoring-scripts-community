@@ -304,9 +304,9 @@ if [ "$Loc" == "e" ]; then
 	command_str="${STb}/speedtest --simple"
 	if [ -n "$SEs" ]; then
 		command_str="${command_str} --server=${SEs}"
-		[ "$debug" == "TRUE" ] && "Using Server ID: ${SEs}"
+		[ "$debug" == "TRUE" ] && echo "Using Server ID: ${SEs}"
 	else
-		[ "$debug" == "TRUE" ] && "No Server ID defined. Using first available server"
+		[ "$debug" == "TRUE" ] && echo "No Server ID defined. Using first available server"
 	fi
 	command=$($command_str)
 elif [ "$Loc" == "i" ]; then
