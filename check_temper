@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # temper.py -*-python-*-
+# Modifications for monitoring: 2020 Michal Moravec (michal.moravec@logicworks.cz)
 # Copyright 2018 by Pham Urwen (urwen@mail.ru)
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -29,6 +30,8 @@ import re
 import select
 import struct
 import sys
+
+SERVICE = "TEMPER SENSORS"
 
 # Non-standard modules
 try:
@@ -277,7 +280,7 @@ class USBRead(object):
         return {"error": "No usable hid/tty devices available"}
 
 
-class Temper(object):
+class Temper:
     SYSPATH = "/sys/bus/usb/devices"
 
     def __init__(self, verbose=False):
@@ -356,50 +359,144 @@ class Temper(object):
             results.append({**info, **usbread.read()})
         return results
 
-    def _add_temperature(self, name, info):
-        """Helper method to add the temperature to a string in both Celsius and
-        Fahrenheit. If no sensor data is available, then '- -' will be returned.
-        """
-        if name not in info:
-            return "- -"
-        degC = info[name]
-        degF = degC * 1.8 + 32.0
-        return "%.2fC %.2fF" % (degC, degF)
-
-    def _add_humidity(self, name, info):
-        """Helper method to add the humidity to a string. If no sensor data is
-        available, then '-' will be returned.
-        """
-
-        if name not in info:
-            return "-"
-        return "%d%%" % int(info[name])
-
-    def print(self, results, use_json=False):
-        """Print out a list of all of the known USB sensor devices on the system.
-        If 'use_json' is True, then JSON formatting will be used.
-        """
-
-        if use_json:
-            print(json.dumps(results, indent=4))
-            return
-
+    def prepare_dataset(self, results):
+        """Prepare RAW data for threshold checking"""
+        dataset = []
         for info in results:
-            s = "Bus %03d Dev %03d %04x:%04x %s" % (
-                info["busnum"],
-                info["devnum"],
-                info["vendorid"],
-                info["productid"],
-                info.get("firmware"),
-            )
+            dataset.append({})
+            dataset[-1]["firmware"] = info.get("firmware")
             if "error" in info:
-                s += " Error: %s" % info["error"]
+                dataset[-1]["error"] = info["error"]
             else:
-                s += " " + self._add_temperature("internal temperature", info)
-                s += " " + self._add_humidity("internal humidity", info)
-                s += " " + self._add_temperature("external temperature", info)
-                s += " " + self._add_humidity("external humidity", info)
-            print(s)
+                dataset[-1]["internal_temperature"] = info.get(
+                    "internal temperature", None
+                )
+                dataset[-1]["internal_humidity"] = info.get("internal humidity", None)
+                dataset[-1]["external_temperature"] = info.get(
+                    "external temperature", None
+                )
+                dataset[-1]["external_humidity"] = info.get("external humidity", None)
+        return dataset
+
+    def report(self, state, message):
+        """Print message string and exit"""
+        print(message)
+        if state == "OK":
+            sys.exit(0)
+        elif state == "WARNING":
+            sys.exit(1)
+        elif state == "CRITICAL":
+            sys.exit(2)
+        elif state == "UNKNOWN":
+            sys.exit(3)
+
+    def add_performace_data(self, config, dataset):
+        """Add perfdata to message string"""
+        message = ""
+        message += "|"
+        for sensor in dataset:
+            if sensor["internal_temperature"]:
+                message += (
+                    f" 'Sensor {sensor['firmware']} internal temperature'"
+                    f"={sensor['internal_temperature']};{config['internal_temperature_warning']};{config['internal_temperature_critical']};;"
+                )
+            if sensor["external_temperature"]:
+                message += (
+                    f" 'Sensor {sensor['firmware']} external temperature'"
+                    f"={sensor['external_temperature']};{config['external_temperature_warning']};{config['external_temperature_critical']};;"
+                )
+            if sensor["internal_humidity"]:
+                message += (
+                    f" 'Sensor {sensor['firmware']} internal humidity'"
+                    f"={sensor['internal_humidity']};{config['internal_humidity_warning']};{config['internal_humidity_critical']};;"
+                )
+            if sensor["external_humidity"]:
+                message += (
+                    f" 'Sensor {sensor['firmware']} external humidity'"
+                    f"={sensor['external_humidity']};{config['external_humidity_warning']};{config['external_humidity_critical']};;"
+                )
+        return message
+
+    def generate_output(self, config, dataset):
+        """Generate output for monitoring"""
+        state = "OK"
+        message = ""
+
+        for sensor in dataset:
+            if sensor["internal_temperature"]:
+                temperature = sensor["internal_temperature"]
+                if temperature > config["internal_temperature_critical"]:
+                    state = "CRITICAL"
+                    message += f"Sensor {sensor['firmware']} internal temperature critical: {temperature}. "
+                elif temperature > config["internal_temperature_warning"]:
+                    state = "WARNING"
+                    message += f"Sensor {sensor['firmware']} internal temperature warning: {temperature}. "
+            if sensor["external_temperature"]:
+                temperature = sensor["external_temperature"]
+                if temperature > config["external_temperature_critical"]:
+                    state = "CRITICAL"
+                    message += f"Sensor {sensor['firmware']} external temperature critical: {temperature}. "
+                elif temperature > config["external_temperature_warning"]:
+                    state = "WARNING"
+                    message += f"Sensor {sensor['firmware']} external temperature warning: {temperature}. "
+            if sensor["internal_humidity"]:
+                humidity = sensor["internal_humidity"]
+                if humidity > config["internal_humidity_critical"]:
+                    state = "CRITICAL"
+                    message += f"Sensor {sensor['firmware']} internal humidity critical: {humidity}. "
+                elif humidity > config["internal_humidity_warning"]:
+                    state = "WARNING"
+                    message += f"Sensor {sensor['firmware']} internal humidity warning: {humidity}. "
+            if sensor["external_humidity"]:
+                humidity = sensor["external_humidity"]
+                if humidity > config["external_humidity_critical"]:
+                    state = "CRITICAL"
+                    message += f"Sensor {sensor['firmware']} external humidity critical: {humidity}. "
+                elif humidity > config["external_humidity_warning"]:
+                    state = "WARNING"
+                    message += f"Sensor {sensor['firmware']} external humidity warning: {humidity}. "
+
+        if state == "OK":
+            message = "All sensor readings in Normal state "
+
+        message = (
+            f"{SERVICE} {state} - "
+            + message
+            + self.add_performace_data(config, dataset)
+        )
+        return state, message
+
+    def parse_thresholds(self, config, args):
+        warning_list = args.warning.split(",")
+        critical_list = args.warning.split(",")
+
+        if len(warning_list) != 4:
+            raise RuntimeError(f"Invalid value of parameter --warning: {args.warning}")
+
+        if len(critical_list) != 4:
+            raise RuntimeError(
+                f"Invalid value of parameter --critical: {args.critical}"
+            )
+
+        try:
+            config["internal_temperature_warning"] = float(warning_list[0])
+            config["external_temperature_warning"] = float(warning_list[1])
+            config["internal_humidity_warning"] = float(warning_list[2])
+            config["external_humidity_warning"] = float(warning_list[3])
+        except KeyError:
+            raise RuntimeError(
+                f"non numerical value in parameter --warning: {args.warning}"
+            )
+
+        try:
+            config["internal_temperature_critical"] = float(critical_list[0])
+            config["external_temperature_critical"] = float(critical_list[1])
+            config["internal_humidity_critical"] = float(critical_list[2])
+            config["external_humidity_critical"] = float(critical_list[3])
+        except KeyError:
+            raise RuntimeError(
+                f"non numerical value in parameter --critical: {args.warning}"
+            )
 
     def main(self):
         """An example 'main' entry point that can be used to make temper.py a
@@ -408,44 +505,33 @@ class Temper(object):
 
         parser = argparse.ArgumentParser(description="temper")
         parser.add_argument(
-            "-l", "--list", action="store_true", help="List all USB devices"
-        )
-        parser.add_argument(
-            "--json", action="store_true", help="Provide output as JSON"
-        )
-        parser.add_argument(
-            "--force",
+            "-w",
+            "--warning",
+            help="Set warning threshold (internal temp,external temp, internal humidity, external humidity)",
+            default="30,30,60,60",
             type=str,
-            help="Force the use of the hex id; ignore other ids",
-            metavar=("VENDOR_ID:PRODUCT_ID"),
         )
         parser.add_argument(
-            "--verbose", action="store_true", help="Output binary data from thermometer"
+            "-c",
+            "--critical",
+            help="Set critical threshold  (internal temp,external temp, internal humidity, external humidity)",
+            default="40,40,80,80",
+            type=str,
+        )
+        parser.add_argument(
+            "--verbose",
+            action="store_true",
+            default=False,
+            help="Output binary data from thermometer",
         )
         args = parser.parse_args()
-        self.verbose = args.verbose
 
-        if args.list:
-            self.list(args.json)
-            return 0
-
-        if args.force:
-            ids = args.force.split(":")
-            if len(ids) != 2:
-                print("Cannot parse hexadecimal id: %s" % args.force)
-                return 1
-            try:
-                vendor_id = int(ids[0], 16)
-                product_id = int(ids[1], 16)
-            except:
-                print("Cannot parse hexadecimal id: %s" % args.force)
-                return 1
-            self.forced_vendor_id = vendor_id
-            self.forced_product_id = product_id
-
-        # By default, output the temperature and humidity for all known sensors.
+        config = {}
+        self.parse_thresholds(config, args)
         results = self.read(args.verbose)
-        self.print(results, args.json)
+        dataset = self.prepare_dataset(results)
+        state, message = self.generate_output(config, dataset)
+        self.report(state, message)
         return 0
 
 
